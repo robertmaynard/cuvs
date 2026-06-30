@@ -10,6 +10,7 @@
 # ##################################################################################################
 enable_testing()
 include(rapids-test)
+include(GoogleTest)
 rapids_test_init()
 
 function(ConfigureTest)
@@ -101,6 +102,13 @@ function(ConfigureTest)
   if(_CUVS_TEST_RUN_SERIAL)
     set_tests_properties(${TEST_NAME} PROPERTIES RUN_SERIAL ON)
   endif()
+
+  gtest_discover_tests(
+    ${TEST_NAME}
+    TEST_PREFIX    "${TEST_NAME}."
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS "gtest_case"
+  )
 endfunction()
 
 # ##################################################################################################

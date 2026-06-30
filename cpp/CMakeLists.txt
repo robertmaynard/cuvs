@@ -1152,6 +1152,9 @@ if(NOT BUILD_CPU_ONLY)
   )
   endblock()
 
+  include(cmake/modules/write_jit_lto_sources_json.cmake)
+  cuvs_write_jit_lto_sources_json()
+
   # Note that this matrix contains an `arch_includes` placeholder, since we don't currently have a
   # way to do an item-wise transform on a list after computing the matrix product and before
   # configuring the file

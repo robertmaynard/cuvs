@@ -4,6 +4,14 @@
 
 set -euo pipefail
 
+TESTS_FILE=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --tests-from-file) TESTS_FILE="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
 . /opt/conda/etc/profile.d/conda.sh
 
 rapids-logger "Configuring conda strict channel priority"
@@ -50,7 +58,11 @@ pytest cpp/tests/python
 # Run libcuvs gtests from libcuvs-tests package
 rapids-logger "Run libcuvs tests"
 pushd "$CONDA_PREFIX"/bin/gtests/libcuvs
-ctest -j8 --output-on-failure
+if [[ -n "$TESTS_FILE" ]]; then
+  ctest -j8 --output-on-failure --tests-from-file "$TESTS_FILE"
+else
+  ctest -j8 --output-on-failure
+fi
 popd
 
 rapids-logger "Test script exiting with value: $EXITCODE"

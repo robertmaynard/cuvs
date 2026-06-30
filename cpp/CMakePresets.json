@@ -1,0 +1,32 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 4, "minor": 0, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "BUILD_TESTS": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "coverage",
+      "displayName": "Coverage (gcov instrumented debug build)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":          "RelWithDebInfo",
+        "CMAKE_C_FLAGS":             "--coverage -O0 -g",
+        "CMAKE_CXX_FLAGS":           "--coverage -O0 -g",
+        "CMAKE_CUDA_FLAGS":          "-lineinfo -Xcompiler --coverage,-O0,-g",
+        "CMAKE_EXE_LINKER_FLAGS":    "--coverage",
+        "CMAKE_SHARED_LINKER_FLAGS": "--coverage"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "coverage", "configurePreset": "coverage" }
+  ]
+}

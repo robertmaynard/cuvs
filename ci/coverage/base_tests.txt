@@ -1,0 +1,9 @@
+# Base tests — always included in selected_tests.txt (Pass 1) regardless of
+# what changed.  Provides broad baseline coverage for every PR.
+#
+# Populate this file after the first nightly mapping run by identifying
+# tests with the widest function coverage across the most commonly touched
+# modules.  Names must match the CTest test names registered by
+# gtest_discover_tests() (format: EXECUTABLE_NAME.SuiteName/CaseName).
+#
+# Initially empty; add entries here after Phase 2 spot-checking.
