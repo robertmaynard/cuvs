@@ -63,21 +63,25 @@ python3 "$SCRIPT_DIR/collect_coverage.py" \
   --build-dir    "$BUILD_DIR"    \
   --coverage-dir "$COVERAGE_DIR" \
   --repo-root    "$REPO_ROOT"    \
-  --continue-on-failure
+  --continue-on-failure          \
+  --resume
 
 # ── Step 3: Build function→test mapping ──────────────────────────────────────
 MAPPING_SCRIPT="$SCRIPT_DIR/build_mapping.py"
 if [[ -f "$MAPPING_SCRIPT" ]]; then
   echo "==> Building func2tests.json ..."
+  UPDATE_FLAG=""
+  [[ -f "$MAPPING_OUT" ]] && UPDATE_FLAG="--update"
   python3 "$MAPPING_SCRIPT" \
     --coverage-dir  "$COVERAGE_DIR" \
     --jit-sources   "$BUILD_DIR/jit_lto_sources.json" \
     --repo-root     "$REPO_ROOT" \
-    --output        "$MAPPING_OUT"
+    --output        "$MAPPING_OUT" \
+    $UPDATE_FLAG
   echo "==> Mapping written to: $MAPPING_OUT"
 else
   echo "==> build_mapping.py not yet present (Phase 2 deliverable). Skipping."
-  echo "    Coverage .info files are in: $COVERAGE_DIR"
+  echo "    Coverage .cov.json files are in: $COVERAGE_DIR"
 fi
 
 echo "==> Done."

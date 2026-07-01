@@ -50,6 +50,7 @@ def apply_jit_lto_logs(
     coverage_dir: Path,
     jit_sources: dict[str, dict],
     file2tests: dict[str, set[str]],
+    skip_tests: set[str] | None = None,
 ) -> None:
     """
     For each per-test .jit.log, look up each activated fragment key in
@@ -66,6 +67,8 @@ def apply_jit_lto_logs(
         test_name, _ = parse_cov_json(cov_path)
         if not test_name:
             continue
+        if skip_tests and test_name in skip_tests:
+            continue
 
         for fragment_key in jit_log.read_text().splitlines():
             fragment_key = fragment_key.strip()
@@ -76,6 +79,19 @@ def apply_jit_lto_logs(
                 path = entry.get(src_key, "")
                 if path:
                     file2tests.setdefault(path, set()).add(test_name)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _peek_test_name(cov_path: Path) -> str:
+    """Read only the test_name field from a .cov.json without loading covered data."""
+    try:
+        with open(cov_path) as f:
+            return json.load(f).get("test_name", "")
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +126,12 @@ def main() -> None:
         default="func2tests.json",
         help="Output path for func2tests.json",
     )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Merge into an existing func2tests.json rather than overwriting it; "
+             "skips .cov.json files whose test_name is already recorded",
+    )
     args = parser.parse_args()
 
     coverage_dir = Path(args.coverage_dir).resolve()
@@ -123,14 +145,27 @@ def main() -> None:
     if not cov_files:
         sys.exit(f"ERROR: no .cov.json files found in {coverage_dir}")
 
-    print(f"Parsing {len(cov_files)} coverage file(s) ...", flush=True)
-
     # {gcov_function_name: {test_name, ...}}
     func2tests: dict[str, set[str]] = {}
     # {repo_relative_source_file: {test_name, ...}}
     file2tests: dict[str, set[str]] = {}
+    already_recorded: set[str] = set()
 
-    for cov_path in cov_files:
+    if args.update and output_path.exists():
+        print(f"Loading existing mapping from {output_path} ...", flush=True)
+        with open(output_path) as f:
+            existing = json.load(f)
+        for fn, tests in existing.get("functions", {}).items():
+            func2tests[fn] = set(tests)
+            already_recorded.update(tests)
+        for src, tests in existing.get("files", {}).items():
+            file2tests[src] = set(tests)
+        print(f"  {len(already_recorded)} test(s) already recorded — will skip their .cov.json files.", flush=True)
+
+    new_files = [p for p in cov_files if _peek_test_name(p) not in already_recorded]
+    print(f"Parsing {len(new_files)} new coverage file(s) (of {len(cov_files)} total) ...", flush=True)
+
+    for cov_path in new_files:
         test_name, coverage = parse_cov_json(cov_path)
         if not test_name:
             print(f"  WARNING: no test_name in {cov_path.name}, skipping", flush=True)
@@ -153,7 +188,7 @@ def main() -> None:
             f"Applying JIT-LTO source map ({len(jit_sources)} fragment tags) ...",
             flush=True,
         )
-        apply_jit_lto_logs(coverage_dir, jit_sources, file2tests)
+        apply_jit_lto_logs(coverage_dir, jit_sources, file2tests, skip_tests=already_recorded)
     else:
         print(
             "  jit_lto_sources.json not found or empty, skipping JIT-LTO mapping.",

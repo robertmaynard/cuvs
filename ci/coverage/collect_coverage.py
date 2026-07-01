@@ -179,6 +179,11 @@ def main() -> None:
         action="store_true",
         help="Capture coverage and continue even when a test fails",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip tests whose .cov.json already exists in --coverage-dir",
+    )
     args = parser.parse_args()
 
     build_dir = Path(args.build_dir).resolve()
@@ -205,6 +210,10 @@ def main() -> None:
         sname = safe_name(test)
         cov_json = coverage_dir / f"{sname}.cov.json"
         jit_log = coverage_dir / f"{sname}.jit.log"
+
+        if args.resume and cov_json.exists():
+            print(f"[{i}/{len(tests)}] skip (already collected): {test}", flush=True)
+            continue
 
         print(f"[{i}/{len(tests)}] {test}", flush=True)
 
