@@ -17,6 +17,7 @@
 #   --coverage-dir PATH   Per-test .cov.json/.jit.log output directory
 #                         (default: <build-dir>/per_test_coverage)
 #   --output PATH         func2tests.json output path (default: <repo>/func2tests.json)
+#   -j N                  Parallel collection workers; set to number of GPUs (default: 6)
 #
 # Prerequisites:
 #   cmake, ninja, gcov (bundled with GCC), python3, and a GPU-capable host with
@@ -32,6 +33,7 @@ BUILD_DIR="$REPO_ROOT/cpp/build/coverage"
 COVERAGE_DIR=""
 MAPPING_OUT="$REPO_ROOT/func2tests.json"
 SKIP_BUILD=0
+JOBS=6
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -39,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --build-dir)    BUILD_DIR="$2"; shift 2 ;;
     --coverage-dir) COVERAGE_DIR="$2"; shift 2 ;;
     --output)       MAPPING_OUT="$2"; shift 2 ;;
+    -j)             JOBS="$2"; shift 2 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -64,7 +67,8 @@ python3 "$SCRIPT_DIR/collect_coverage.py" \
   --coverage-dir "$COVERAGE_DIR" \
   --repo-root    "$REPO_ROOT"    \
   --continue-on-failure          \
-  --resume
+  --resume                       \
+  -j             "$JOBS"
 
 # ── Step 3: Build function→test mapping ──────────────────────────────────────
 MAPPING_SCRIPT="$SCRIPT_DIR/build_mapping.py"

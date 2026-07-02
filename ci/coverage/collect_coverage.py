@@ -12,12 +12,20 @@
 # Outputs (in --coverage-dir):
 #   <safe_name>.cov.json  — gcov coverage for one GTest case
 #   <safe_name>.jit.log   — one JIT-LTO fragment key per line (may be empty)
+#
+# Parallelism (-j N):
+#   Each worker is assigned a non-overlapping slice of the test list and runs
+#   its tests sequentially.  Workers are isolated via GCOV_PREFIX: each worker
+#   gets its own directory under <coverage-dir>/.gcda_workers/worker_N/ so
+#   gcda files from different workers never mix.  Use -j 1 on a single-GPU
+#   machine; set -j to match the number of available GPUs.
 
 import argparse
 import concurrent.futures
 import gzip
 import hashlib
 import json
+import multiprocessing
 import os
 import re
 import subprocess
@@ -53,36 +61,24 @@ def list_gtest_case_tests(build_dir: Path) -> list[tuple[int, str]]:
     return tests
 
 
-def delete_gcda_files(build_dir: Path) -> None:
-    for subdir in ("CMakeFiles", "tests/CMakeFiles"):
-        d = build_dir / subdir
-        if d.exists():
-            for gcda in d.rglob("*.gcda"):
-                gcda.unlink(missing_ok=True)
-
-
-def run_single_test(test_index: int, build_dir: Path, jit_log: Path) -> bool:
-    """Run one CTest test by its global index (avoids regex issues with test names)."""
-    env = os.environ.copy()
-    env["CUVS_JIT_TRACE_LOG"] = str(jit_log)
-    result = subprocess.run(
-        ["ctest", "-I", f"{test_index},{test_index}", "--output-on-failure"],
-        cwd=build_dir,
-        env=env,
-    )
-    return result.returncode == 0
-
-
-def _process_gcda(args: tuple[int, Path, Path]) -> list[dict]:
+def _process_gcda(args: tuple[int, Path, Path, Path | None]) -> list[dict]:
     """Run gcov --json-format on one gcda file; return parsed file entries."""
-    idx, gcda, tmp = args
+    idx, gcda, tmp, prefix_dir = args
     work = tmp / str(idx)
     work.mkdir(exist_ok=True)
-    subprocess.run(
-        ["gcov", "--json-format", "--demangled-names", str(gcda)],
-        cwd=work,
-        capture_output=True,
-    )
+
+    if prefix_dir is not None:
+        # Recover the build-tree directory where the matching .gcno lives by
+        # stripping the GCOV_PREFIX from the gcda path.
+        rel = gcda.relative_to(prefix_dir)
+        gcno_dir = Path("/") / rel.parent
+        gcov_cmd = ["gcov", "--json-format", "--demangled-names",
+                    "-o", str(gcno_dir), str(gcda)]
+    else:
+        gcov_cmd = ["gcov", "--json-format", "--demangled-names", str(gcda)]
+
+    subprocess.run(gcov_cmd, cwd=work, capture_output=True)
+
     results: list[dict] = []
     for gz_file in work.glob("*.gcov.json.gz"):
         try:
@@ -98,16 +94,24 @@ def capture_coverage_gcov(
     cov_json: Path,
     test_name: str,
     repo_root: Path | None = None,
+    prefix_dir: Path | None = None,
 ) -> None:
     """
-    Run gcov --json-format on all gcda files produced by the test, filter to
+    Run gcov --json-format on the gcda files produced by the test, filter to
     cuVS sources, and write a per-test .cov.json file.
+
+    When prefix_dir is set (parallel mode), gcda files are searched under that
+    directory (they were redirected there via GCOV_PREFIX).  gcov is pointed at
+    the build tree for .gcno files via -o.
     """
-    gcda_files: list[Path] = []
-    for subdir in ("CMakeFiles", "tests/CMakeFiles"):
-        d = build_dir / subdir
-        if d.exists():
-            gcda_files.extend(d.rglob("*.gcda"))
+    if prefix_dir is not None:
+        gcda_files = list(prefix_dir.rglob("*.gcda"))
+    else:
+        gcda_files = []
+        for subdir in ("CMakeFiles", "tests/CMakeFiles"):
+            d = build_dir / subdir
+            if d.exists():
+                gcda_files.extend(d.rglob("*.gcda"))
 
     if not gcda_files:
         cov_json.write_text(json.dumps({"test_name": test_name, "covered": {}}) + "\n")
@@ -118,7 +122,7 @@ def capture_coverage_gcov(
 
     with tempfile.TemporaryDirectory(prefix="cuvs_gcov_") as tmpdir:
         tmp = Path(tmpdir)
-        work_args = [(i, gcda, tmp) for i, gcda in enumerate(gcda_files)]
+        work_args = [(i, gcda, tmp, prefix_dir) for i, gcda in enumerate(gcda_files)]
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             for file_entries in executor.map(_process_gcda, work_args):
@@ -150,6 +154,80 @@ def capture_coverage_gcov(
     }
     cov_json.write_text(json.dumps(result, indent=2) + "\n")
 
+
+# ---------------------------------------------------------------------------
+# Worker — must be module-level to be picklable by multiprocessing
+# ---------------------------------------------------------------------------
+
+def _collect_worker(
+    worker_id: int,
+    test_slice: list[tuple[int, str]],
+    build_dir_str: str,
+    coverage_dir_str: str,
+    repo_root_str: str,
+    prefix_base_str: str,
+    continue_on_failure: bool,
+    resume: bool,
+) -> list[str]:
+    """
+    Run a slice of tests sequentially, writing one .cov.json and one .jit.log
+    per test.  gcda files are isolated to this worker's GCOV_PREFIX directory
+    so concurrent workers never interfere with each other.
+
+    Returns a list of test names that failed.
+    """
+    build_dir = Path(build_dir_str)
+    coverage_dir = Path(coverage_dir_str)
+    repo_root = Path(repo_root_str)
+    prefix_dir = Path(prefix_base_str) / f"worker_{worker_id}"
+    prefix_dir.mkdir(parents=True, exist_ok=True)
+
+    total = len(test_slice)
+    failures: list[str] = []
+
+    for i, (test_index, test) in enumerate(test_slice, 1):
+        sname = safe_name(test)
+        cov_json = coverage_dir / f"{sname}.cov.json"
+        jit_log = coverage_dir / f"{sname}.jit.log"
+
+        if resume and cov_json.exists():
+            print(f"[w{worker_id} {i}/{total}] skip: {test}", flush=True)
+            continue
+
+        print(f"[w{worker_id} {i}/{total}] {test}", flush=True)
+
+        # Clear this worker's isolated gcda tree before each test
+        for gcda in prefix_dir.rglob("*.gcda"):
+            gcda.unlink(missing_ok=True)
+
+        env = os.environ.copy()
+        env["GCOV_PREFIX"] = str(prefix_dir)
+        env["CUVS_JIT_TRACE_LOG"] = str(jit_log)
+
+        result = subprocess.run(
+            ["ctest", "-I", f"{test_index},{test_index}", "--output-on-failure"],
+            cwd=build_dir,
+            env=env,
+        )
+        if result.returncode != 0:
+            print(f"  [w{worker_id}] WARNING: test failed — coverage captured anyway: {test}",
+                  flush=True)
+            failures.append(test)
+            if not continue_on_failure:
+                return failures
+
+        capture_coverage_gcov(
+            build_dir, cov_json, test,
+            repo_root=repo_root,
+            prefix_dir=prefix_dir,
+        )
+
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -184,11 +262,23 @@ def main() -> None:
         action="store_true",
         help="Skip tests whose .cov.json already exists in --coverage-dir",
     )
+    parser.add_argument(
+        "-j", "--jobs",
+        type=int,
+        default=6,
+        help="Number of parallel collection workers; set to match available GPUs (default: 6)",
+    )
     args = parser.parse_args()
 
     build_dir = Path(args.build_dir).resolve()
-    coverage_dir = Path(args.coverage_dir).resolve() if args.coverage_dir else build_dir / "per_test_coverage"
-    repo_root = Path(args.repo_root).resolve() if args.repo_root else build_dir.parent.parent.parent
+    coverage_dir = (
+        Path(args.coverage_dir).resolve() if args.coverage_dir
+        else build_dir / "per_test_coverage"
+    )
+    repo_root = (
+        Path(args.repo_root).resolve() if args.repo_root
+        else build_dir.parent.parent.parent
+    )
 
     if not build_dir.exists():
         sys.exit(f"ERROR: build directory does not exist: {build_dir}")
@@ -204,32 +294,38 @@ def main() -> None:
         )
     print(f"Found {len(tests)} test(s).", flush=True)
 
-    failures: list[str] = []
+    n_workers = min(args.jobs, len(tests))
+    prefix_base = coverage_dir / ".gcda_workers"
+    prefix_base.mkdir(parents=True, exist_ok=True)
 
-    for i, (test_index, test) in enumerate(tests, 1):
-        sname = safe_name(test)
-        cov_json = coverage_dir / f"{sname}.cov.json"
-        jit_log = coverage_dir / f"{sname}.jit.log"
+    # Round-robin assignment keeps each worker's slice roughly equal in length
+    # and spreads slow/fast tests across workers rather than front-loading them.
+    chunks: list[list[tuple[int, str]]] = [tests[i::n_workers] for i in range(n_workers)]
 
-        if args.resume and cov_json.exists():
-            print(f"[{i}/{len(tests)}] skip (already collected): {test}", flush=True)
-            continue
+    worker_args = [
+        (
+            i,
+            chunk,
+            str(build_dir),
+            str(coverage_dir),
+            str(repo_root),
+            str(prefix_base),
+            args.continue_on_failure,
+            args.resume,
+        )
+        for i, chunk in enumerate(chunks)
+    ]
 
-        print(f"[{i}/{len(tests)}] {test}", flush=True)
+    print(f"Running {n_workers} worker(s) ...", flush=True)
 
-        delete_gcda_files(build_dir)
+    if n_workers == 1:
+        all_failures = [_collect_worker(*worker_args[0])]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = [executor.submit(_collect_worker, *wa) for wa in worker_args]
+            all_failures = [f.result() for f in futures]
 
-        success = run_single_test(test_index, build_dir, jit_log)
-        if not success:
-            print(f"  WARNING: test failed — coverage captured anyway: {test}", flush=True)
-            failures.append(test)
-            if not args.continue_on_failure:
-                sys.exit(
-                    "Aborting after first failure. "
-                    "Use --continue-on-failure to proceed despite failures."
-                )
-
-        capture_coverage_gcov(build_dir, cov_json, test, repo_root=repo_root)
+    failures = [name for worker_failures in all_failures for name in worker_failures]
 
     print(f"\nCoverage files written to: {coverage_dir}", flush=True)
 
