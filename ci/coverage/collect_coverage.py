@@ -333,7 +333,8 @@ def main() -> None:
         print(f"\n{len(failures)} test(s) failed during collection:", flush=True)
         for f in failures:
             print(f"  {f}", flush=True)
-        sys.exit(1)
+        if not args.continue_on_failure:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
