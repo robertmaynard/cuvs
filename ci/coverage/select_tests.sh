@@ -82,13 +82,24 @@ echo "==> Getting changed files ..."
 if [[ -n "$PR_NUMBER" ]]; then
   gh pr diff "$PR_NUMBER" --name-only > "$WORK_DIR/all_changed.txt"
 else
-  git -C "$REPO_ROOT" diff --name-only "${BASE_REF}...HEAD" > "$WORK_DIR/all_changed.txt"
+  # Committed changes on this branch vs base, plus any staged/unstaged edits
+  # not yet committed.  Using separate commands and deduplicating so that a
+  # local work-in-progress edit is included without pulling in every prior
+  # commit on the branch when diffing against a common ancestor.
+  { git -C "$REPO_ROOT" diff --name-only "${BASE_REF}...HEAD"
+    git -C "$REPO_ROOT" diff --name-only HEAD
+  } | sort -u > "$WORK_DIR/all_changed.txt"
 fi
 
 # Filter to C/C++/CUDA source files
 grep -E '\.(c|cc|cpp|cu|cuh|hpp|h)$' "$WORK_DIR/all_changed.txt" > "$CHANGED_FILES" || true
 
-echo "  $(wc -l < "$WORK_DIR/all_changed.txt") file(s) changed; $(wc -l < "$CHANGED_FILES") are C/C++/CUDA"
+N_ALL=$(wc -l < "$WORK_DIR/all_changed.txt")
+N_SRC=$(wc -l < "$CHANGED_FILES")
+echo "  $N_ALL file(s) changed; $N_SRC are C/C++/CUDA"
+if [[ -s "$CHANGED_FILES" ]]; then
+  while IFS= read -r f; do echo "    $f"; done < "$CHANGED_FILES"
+fi
 
 if [[ ! -s "$CHANGED_FILES" ]]; then
   echo "  No C/C++/CUDA files changed — selecting base tests only."

@@ -101,12 +101,12 @@ def list_gtest_case_tests(ctest_dir: Path) -> list[str]:
 # ctags processing
 # ---------------------------------------------------------------------------
 
-def extract_qualified_names(ctags_jsonl_path: Path) -> list[str]:
+def extract_qualified_names(ctags_jsonl_path: Path) -> list[tuple[str, str]]:
     """
     Parse a universal-ctags JSONL file (one JSON object per line) and return
-    a list of fully-qualified function/method names.
+    a list of (fully-qualified function name, repo-relative source path) pairs.
     """
-    names: list[str] = []
+    names: list[tuple[str, str]] = []
     with open(ctags_jsonl_path, errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -124,7 +124,8 @@ def extract_qualified_names(ctags_jsonl_path: Path) -> list[str]:
             name = tag.get("name", "")
             scope = tag.get("scope", "")
             qualified = f"{scope}::{name}" if scope else name
-            names.append(qualified)
+            path = tag.get("path", "")
+            names.append((qualified, path))
     return names
 
 
@@ -195,13 +196,11 @@ def main() -> None:
     ]
 
     selected: set[str] = set()
+    # Tracks which changed files had at least one function-level hit.
+    # File-level lookup is used as a fallback only for files with no hits.
+    files_with_function_hits: set[str] = set()
 
-    # 1. File-level lookup for every changed file
-    for path in changed_files:
-        for test in file_map.get(path, []):
-            selected.add(test)
-
-    # 2. Function-level lookup via ctags
+    # 1. Function-level lookup via ctags (preferred; more precise than file-level)
     if args.ctags_jsonl:
         ctags_path = Path(args.ctags_jsonl)
         if ctags_path.exists():
@@ -210,10 +209,28 @@ def main() -> None:
                 f"  {len(qualified_names)} function(s) extracted from ctags output",
                 flush=True,
             )
-            for qname in qualified_names:
-                selected.update(find_tests_for_function(qname, func_map))
+            for qname, src_path in qualified_names:
+                hits = find_tests_for_function(qname, func_map)
+                if hits:
+                    selected.update(hits)
+                    if src_path:
+                        files_with_function_hits.add(src_path)
         else:
             print(f"  WARNING: ctags JSONL not found: {ctags_path}", flush=True)
+
+    # 2. File-level fallback — only for files where function-level found nothing.
+    # This covers: new functions not yet in the mapping, non-function changes
+    # (type definitions, macros, includes), and files ctags produced no tags for.
+    fallback_files = [p for p in changed_files if p not in files_with_function_hits]
+    if fallback_files:
+        print(
+            f"  {len(fallback_files)} file(s) with no function-level hits — "
+            f"using file-level fallback",
+            flush=True,
+        )
+    for path in fallback_files:
+        for test in file_map.get(path, []):
+            selected.add(test)
 
     # 3. BASE tests always run in Pass 1
     base_tests: list[str] = []
