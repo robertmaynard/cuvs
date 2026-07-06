@@ -28,6 +28,19 @@
 
 set -euo pipefail
 
+# Universal ctags is required for --output-format=json and CUDA language support.
+# On Ubuntu, apt install universal-ctags installs the binary as ctags-universal
+# alongside exuberant-ctags (which owns the plain ctags name).
+if command -v ctags-universal &>/dev/null; then
+  CTAGS_BIN="ctags-universal"
+elif command -v ctags &>/dev/null; then
+  CTAGS_BIN="ctags"
+else
+  echo "ERROR: universal ctags is required but not found." >&2
+  echo "  Install: sudo apt-get install universal-ctags" >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
@@ -117,16 +130,21 @@ if [[ -s "$CHANGED_FILES" ]]; then
   done < "$CHANGED_FILES"
 
   if [[ ${#EXISTING_FILES[@]} -gt 0 ]]; then
-    ctags \
+    "$CTAGS_BIN" \
       --output-format=json \
       --fields=+nKs \
       --kinds-C++=f+p \
       --kinds-CUDA=f \
-      --language-force=C++ \
+      --langmap=C++:+.cuh \
       -f - \
-      -- "${EXISTING_FILES[@]}" \
-      > "$CTAGS_JSONL" 2>/dev/null || true
-    echo "  $(wc -l < "$CTAGS_JSONL") tag(s) extracted"
+      "${EXISTING_FILES[@]}" \
+      > "$CTAGS_JSONL" 2>"$WORK_DIR/ctags_stderr.txt" || true
+    N_TAGS=$(wc -l < "$CTAGS_JSONL")
+    echo "  $N_TAGS tag(s) extracted"
+    if [[ "$N_TAGS" -eq 0 && -s "$WORK_DIR/ctags_stderr.txt" ]]; then
+      echo "  ctags stderr:" >&2
+      cat "$WORK_DIR/ctags_stderr.txt" >&2
+    fi
   else
     touch "$CTAGS_JSONL"
   fi
