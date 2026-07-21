@@ -105,8 +105,9 @@ function(ConfigureTest)
 
   gtest_discover_tests(
     ${TEST_NAME}
-    TEST_PREFIX    "${TEST_NAME}."
-    DISCOVERY_MODE PRE_TEST
+    TEST_PREFIX       "${TEST_NAME}."
+    DISCOVERY_MODE    PRE_TEST
+    DISCOVERY_TIMEOUT 600
     PROPERTIES LABELS "gtest_case"
   )
 endfunction()

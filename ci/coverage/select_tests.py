@@ -80,8 +80,27 @@ def list_registered_tests(ctest_dir: Path, ctest_bin: str = "ctest") -> list[str
     return tests
 
 
-def list_gtest_case_tests(ctest_dir: Path, ctest_bin: str = "ctest") -> list[str]:
-    """Return only gtest_case-labelled tests (fine-grained, one GTest case each)."""
+def list_gtest_case_tests(
+    ctest_dir: Path,
+    ctest_bin: str = "ctest",
+    refresh: bool = False,
+) -> list[str]:
+    """Return only gtest_case-labelled tests (fine-grained, one GTest case each).
+
+    Results are cached in gtest_case_list_cache.txt inside ctest_dir and reused
+    as long as the cache is newer than CTestTestfile.cmake (which CMake touches
+    on every reconfigure).  Pass refresh=True to force a re-query regardless.
+    """
+    cache_path = ctest_dir / "gtest_case_list_cache.txt"
+
+    if not refresh and cache_path.exists():
+        ctestfile = ctest_dir / "CTestTestfile.cmake"
+        if not ctestfile.exists() or cache_path.stat().st_mtime >= ctestfile.stat().st_mtime:
+            tests = [l.strip() for l in cache_path.read_text().splitlines() if l.strip()]
+            print(f"  Using cached test list ({len(tests)} tests) from {cache_path}", flush=True)
+            return tests
+        print(f"  Cache is stale (build reconfigured) — re-querying ctest", flush=True)
+
     result = subprocess.run(
         [ctest_bin, "-N", "-L", "gtest_case"],
         cwd=ctest_dir,
@@ -94,6 +113,10 @@ def list_gtest_case_tests(ctest_dir: Path, ctest_bin: str = "ctest") -> list[str
         m = re.match(r"\s+Test\s+#\d+:\s+(.+)", line)
         if m:
             tests.append(m.group(1).strip())
+
+    cache_path.write_text("\n".join(tests) + "\n")
+    print(f"  Cached {len(tests)} tests to {cache_path}", flush=True)
+
     return tests
 
 
@@ -169,6 +192,11 @@ def main() -> None:
         "--ctest-bin",
         default="ctest",
         help="ctest executable to use (default: ctest)",
+    )
+    parser.add_argument(
+        "--refresh-test-list",
+        action="store_true",
+        help="Force re-query of ctest -N even if a valid cache exists",
     )
     parser.add_argument(
         "--selected-output",
@@ -249,7 +277,7 @@ def main() -> None:
     ctest_dir = Path(args.ctest_dir)
     print(f"Querying registered tests from {ctest_dir} ...", flush=True)
     try:
-        registered = list_gtest_case_tests(ctest_dir, args.ctest_bin)
+        registered = list_gtest_case_tests(ctest_dir, args.ctest_bin, args.refresh_test_list)
     except subprocess.CalledProcessError as e:
         sys.exit(f"ERROR: ctest -N failed: {e}")
 
@@ -279,7 +307,7 @@ def main() -> None:
         flush=True,
     )
     print(
-        f"Total    : {len(registered):>5} registered gtest_case tests",
+        f"Total    : {len(registered_set):>5} registered gtest_case tests",
         flush=True,
     )
 

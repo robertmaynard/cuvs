@@ -44,6 +44,19 @@ def safe_name(test_name: str) -> str:
     return sanitized[:_MAX_SAFE_LEN - 9] + "_" + digest
 
 
+def detect_gpu_count() -> int:
+    """Return the number of CUDA GPUs visible to nvidia-smi, or 1 if unavailable."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True, text=True, check=True,
+        )
+        count = sum(1 for line in result.stdout.splitlines() if line.strip())
+        return max(1, count)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return 1
+
+
 def list_gtest_case_tests(build_dir: Path) -> list[tuple[int, str]]:
     """Return (global_ctest_index, test_name) for every gtest_case-labelled test."""
     result = subprocess.run(
@@ -168,6 +181,7 @@ def _collect_worker(
     prefix_base_str: str,
     continue_on_failure: bool,
     resume: bool,
+    n_gpus: int = 1,
 ) -> list[str]:
     """
     Run a slice of tests sequentially, writing one .cov.json and one .jit.log
@@ -203,6 +217,7 @@ def _collect_worker(
         env = os.environ.copy()
         env["GCOV_PREFIX"] = str(prefix_dir)
         env["CUVS_JIT_TRACE_LOG"] = str(jit_log)
+        env["CUDA_VISIBLE_DEVICES"] = str(worker_id % n_gpus)
 
         result = subprocess.run(
             ["ctest", "-I", f"{test_index},{test_index}", "--output-on-failure"],
@@ -265,8 +280,15 @@ def main() -> None:
     parser.add_argument(
         "-j", "--jobs",
         type=int,
-        default=6,
-        help="Number of parallel collection workers; set to match available GPUs (default: 6)",
+        default=None,
+        help="Number of parallel collection workers (default: number of GPUs detected by nvidia-smi)",
+    )
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs available for CUDA_VISIBLE_DEVICES pinning "
+             "(default: auto-detected via nvidia-smi)",
     )
     args = parser.parse_args()
 
@@ -294,7 +316,10 @@ def main() -> None:
         )
     print(f"Found {len(tests)} test(s).", flush=True)
 
-    n_workers = min(args.jobs, len(tests))
+    n_gpus = args.gpus if args.gpus is not None else detect_gpu_count()
+    n_workers = min(args.jobs if args.jobs is not None else n_gpus, len(tests))
+    print(f"GPUs: {n_gpus}  workers: {n_workers}", flush=True)
+
     prefix_base = coverage_dir / ".gcda_workers"
     prefix_base.mkdir(parents=True, exist_ok=True)
 
@@ -312,6 +337,7 @@ def main() -> None:
             str(prefix_base),
             args.continue_on_failure,
             args.resume,
+            n_gpus,
         )
         for i, chunk in enumerate(chunks)
     ]
