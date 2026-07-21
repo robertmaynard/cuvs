@@ -21,10 +21,13 @@
 #   --ctest-dir PATH    Directory from which to run ctest -N
 #                       (default: cpp/build/coverage if it exists, otherwise
 #                        $CONDA_PREFIX/bin/gtests/libcuvs)
+#   --ctest-bin PATH    ctest executable to use (default: ctest)
 #   --base-tests PATH   base_tests.txt to always include (default: auto-detected)
 #   --selected PATH     Output file for selected tests  (default: selected_tests.txt)
 #   --remaining PATH    Output file for remaining tests (default: remaining_tests.txt)
 #   --work-dir PATH     Scratch directory for intermediate files (default: /tmp/cuvs-select)
+#   --run               After selecting, run Pass 1 (selected tests) with ctest
+#   -j N                Parallelism passed to ctest when --run is active (default: 8)
 
 set -euo pipefail
 
@@ -48,10 +51,13 @@ PR_NUMBER=""
 BASE_REF=""
 MAPPING="$REPO_ROOT/func2tests.json"
 CTEST_DIR=""
+CTEST_BIN=""
 BASE_TESTS="$SCRIPT_DIR/base_tests.txt"
 SELECTED_OUT="selected_tests.txt"
 REMAINING_OUT="remaining_tests.txt"
 WORK_DIR="/tmp/cuvs-select-$$"
+RUN=0
+JOBS=8
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -59,10 +65,13 @@ while [[ $# -gt 0 ]]; do
     --base-ref)    BASE_REF="$2";    shift 2 ;;
     --mapping)     MAPPING="$2";     shift 2 ;;
     --ctest-dir)   CTEST_DIR="$2";   shift 2 ;;
+    --ctest-bin)   CTEST_BIN="$2";   shift 2 ;;
     --base-tests)  BASE_TESTS="$2";  shift 2 ;;
     --selected)    SELECTED_OUT="$2"; shift 2 ;;
     --remaining)   REMAINING_OUT="$2"; shift 2 ;;
     --work-dir)    WORK_DIR="$2";    shift 2 ;;
+    --run)         RUN=1;            shift   ;;
+    -j)            JOBS="$2";        shift 2 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -159,6 +168,9 @@ BASE_TESTS_ARG=""
 CTAGS_ARG=""
 [[ -f "$CTAGS_JSONL" ]] && CTAGS_ARG="--ctags-jsonl $CTAGS_JSONL"
 
+CTEST_BIN_ARG=""
+[[ -n "$CTEST_BIN" ]] && CTEST_BIN_ARG="--ctest-bin $CTEST_BIN"
+
 python3 "$SCRIPT_DIR/select_tests.py" \
   --mapping       "$MAPPING"        \
   --changed-files "$CHANGED_FILES"  \
@@ -166,8 +178,18 @@ python3 "$SCRIPT_DIR/select_tests.py" \
   --selected-output  "$SELECTED_OUT"  \
   --remaining-output "$REMAINING_OUT" \
   $BASE_TESTS_ARG \
-  $CTAGS_ARG
+  $CTAGS_ARG \
+  $CTEST_BIN_ARG
 
 echo "==> Done."
-echo "    Pass 1: ctest --tests-from-file $SELECTED_OUT"
-echo "    Pass 2: ctest --tests-from-file $REMAINING_OUT"
+echo "    Pass 1: ${CTEST_BIN:-ctest} --tests-from-file $SELECTED_OUT"
+echo "    Pass 2: ${CTEST_BIN:-ctest} --tests-from-file $REMAINING_OUT"
+
+if [[ "$RUN" -eq 1 ]]; then
+  echo "==> Running Pass 1 ..."
+  "${CTEST_BIN:-ctest}" \
+    --test-dir  "$CTEST_DIR" \
+    -j "$JOBS"  \
+    --output-on-failure \
+    --tests-from-file "$SELECTED_OUT"
+fi

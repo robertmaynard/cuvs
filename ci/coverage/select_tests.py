@@ -63,10 +63,10 @@ def find_tests_for_function(ctags_name: str, func_map: dict[str, list[str]]) -> 
 # CTest helpers
 # ---------------------------------------------------------------------------
 
-def list_registered_tests(ctest_dir: Path) -> list[str]:
+def list_registered_tests(ctest_dir: Path, ctest_bin: str = "ctest") -> list[str]:
     """Return all test names registered with CTest in ctest_dir."""
     result = subprocess.run(
-        ["ctest", "-N"],
+        [ctest_bin, "-N"],
         cwd=ctest_dir,
         capture_output=True,
         text=True,
@@ -80,10 +80,10 @@ def list_registered_tests(ctest_dir: Path) -> list[str]:
     return tests
 
 
-def list_gtest_case_tests(ctest_dir: Path) -> list[str]:
+def list_gtest_case_tests(ctest_dir: Path, ctest_bin: str = "ctest") -> list[str]:
     """Return only gtest_case-labelled tests (fine-grained, one GTest case each)."""
     result = subprocess.run(
-        ["ctest", "-N", "-L", "gtest_case"],
+        [ctest_bin, "-N", "-L", "gtest_case"],
         cwd=ctest_dir,
         capture_output=True,
         text=True,
@@ -166,6 +166,11 @@ def main() -> None:
         help="Directory from which to run ctest -N (build dir or installed gtests dir)",
     )
     parser.add_argument(
+        "--ctest-bin",
+        default="ctest",
+        help="ctest executable to use (default: ctest)",
+    )
+    parser.add_argument(
         "--selected-output",
         default="selected_tests.txt",
         help="Output file for selected tests",
@@ -244,7 +249,7 @@ def main() -> None:
     ctest_dir = Path(args.ctest_dir)
     print(f"Querying registered tests from {ctest_dir} ...", flush=True)
     try:
-        registered = list_gtest_case_tests(ctest_dir)
+        registered = list_gtest_case_tests(ctest_dir, args.ctest_bin)
     except subprocess.CalledProcessError as e:
         sys.exit(f"ERROR: ctest -N failed: {e}")
 
