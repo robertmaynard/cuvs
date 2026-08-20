@@ -14,13 +14,13 @@
     },
     {
       "name": "coverage",
-      "displayName": "Coverage (gcov instrumented debug build)",
+      "displayName": "Coverage (gcov instrumented build)",
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE":          "RelWithDebInfo",
-        "CMAKE_C_FLAGS":             "--coverage -O0 -g",
-        "CMAKE_CXX_FLAGS":           "--coverage -O0 -g",
-        "CMAKE_CUDA_FLAGS":          "-lineinfo -Xcompiler --coverage,-O0,-g",
+        "CMAKE_C_FLAGS":             "--coverage -g",
+        "CMAKE_CXX_FLAGS":           "--coverage -g",
+        "CMAKE_CUDA_FLAGS":          "-lineinfo -Xcompiler --coverage,-g",
         "CMAKE_EXE_LINKER_FLAGS":    "--coverage",
         "CMAKE_SHARED_LINKER_FLAGS": "--coverage"
       }
