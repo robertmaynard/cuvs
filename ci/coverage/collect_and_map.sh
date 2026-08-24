@@ -62,6 +62,11 @@ else
 fi
 
 # ── Step 2: Per-test gcov collection ─────────────────────────────────────────
+# collect_coverage.py invokes ctest exactly once (ctest --show-only=json-v1) to
+# discover every gtest_case test's exact command/cwd/env/timeout, then executes
+# each test binary directly for the rest of the run. This avoids paying
+# gtest_discover_tests(DISCOVERY_MODE PRE_TEST)'s full-binary GTest rescan on
+# every individual test — see the module docstring in collect_coverage.py.
 echo "==> Collecting per-test coverage ..."
 JOBS_ARG=""
 [[ -n "$JOBS" ]] && JOBS_ARG="-j $JOBS"

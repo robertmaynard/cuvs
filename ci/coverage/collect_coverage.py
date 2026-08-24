@@ -13,6 +13,26 @@
 #   <safe_name>.cov.json  — gcov coverage for one GTest case
 #   <safe_name>.jit.log   — one JIT-LTO fragment key per line (may be empty)
 #
+# Test execution: ctest is invoked exactly ONCE, not once per test.
+#   cuVS's tests are registered with gtest_discover_tests(DISCOVERY_MODE PRE_TEST),
+#   which defers GTest enumeration to ctest run time. That means every ctest
+#   invocation — even one selecting a single test — re-runs `--gtest_list_tests`
+#   against every gtest_case test binary to rebuild the full catalog before it
+#   can find the requested test. Measured on this build: ~109s of pure
+#   discovery overhead per ctest invocation, vs. ~1-2s of actual test runtime.
+#   At thousands of tests, invoking ctest per test makes discovery overhead the
+#   dominant cost of collection.
+#
+#   Instead, `load_ctest_index()` calls `ctest --show-only=json-v1 -L gtest_case`
+#   once at startup, paying that ~109s discovery cost a single time for the
+#   whole run. This returns, per test, the exact argv ctest would have used
+#   (binary path + `--gtest_filter=...` + any extra args GoogleTest's module
+#   adds), plus its WORKING_DIRECTORY/ENVIRONMENT/TIMEOUT properties. Workers
+#   then invoke that captured command directly via subprocess, bypassing ctest
+#   entirely for the remaining N-1 tests. We take over what ctest previously
+#   did for free: pass/fail via returncode, timeout enforcement, and
+#   output-on-failure-only logging.
+#
 # Parallelism (-j N):
 #   Each worker is assigned a non-overlapping slice of the test list and runs
 #   its tests sequentially.  Workers are isolated via GCOV_PREFIX: each worker
@@ -31,6 +51,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 _MAX_SAFE_LEN = 200
@@ -57,21 +78,61 @@ def detect_gpu_count() -> int:
         return 1
 
 
-def list_gtest_case_tests(build_dir: Path) -> list[tuple[int, str]]:
-    """Return (global_ctest_index, test_name) for every gtest_case-labelled test."""
+def load_ctest_index(build_dir: Path) -> list[dict]:
+    """
+    Discover every gtest_case-labelled test exactly once via
+    `ctest --show-only=json-v1`, returning an ordered list of
+    {name, command, working_directory, environment, timeout} entries — one
+    per ctest test *invocation*, in ctest's own discovery order.
+
+    This is the only ctest invocation collection performs — each entry's
+    `command` list is executed directly (bypassing ctest) for the remainder
+    of the run, to avoid paying gtest_discover_tests(DISCOVERY_MODE
+    PRE_TEST)'s full-binary rescan cost on every single test run.
+
+    Returns a list, not a dict keyed by name: cuVS's parameterized GTest
+    cases can stringify to identical ctest test names (observed: 486 duplicate
+    names out of 7475 entries on a real build, e.g. two float rounding cases
+    that print the same). ctest itself distinguishes these by internal numeric
+    ID, not name, and runs both — collapsing to a name-keyed dict would
+    silently drop one of every duplicate pair's invocation entirely.
+    """
     result = subprocess.run(
-        ["ctest", "-N", "-L", "gtest_case"],
+        ["ctest", "--show-only=json-v1", "-L", "gtest_case"],
         cwd=build_dir,
         capture_output=True,
         text=True,
         check=True,
     )
-    tests: list[tuple[int, str]] = []
-    for line in result.stdout.splitlines():
-        m = re.match(r"\s+Test\s+#(\d+):\s+(.+)", line)
-        if m:
-            tests.append((int(m.group(1)), m.group(2).strip()))
-    return tests
+    data = json.loads(result.stdout)
+
+    entries: list[dict] = []
+    for test in data.get("tests", []):
+        command = test.get("command", [])
+        props = {p["name"]: p.get("value") for p in test.get("properties", [])}
+
+        env: dict[str, str] = {}
+        for item in props.get("ENVIRONMENT") or []:
+            if "=" in item:
+                k, v = item.split("=", 1)
+                env[k] = v
+
+        timeout = None
+        raw_timeout = props.get("TIMEOUT")
+        if raw_timeout not in (None, ""):
+            try:
+                timeout = float(raw_timeout)
+            except (TypeError, ValueError):
+                timeout = None
+
+        entries.append({
+            "name": test["name"],
+            "command": command,
+            "working_directory": props.get("WORKING_DIRECTORY"),
+            "environment": env,
+            "timeout": timeout,
+        })
+    return entries
 
 
 def _process_gcda(args: tuple[int, Path, Path, Path | None]) -> list[dict]:
@@ -174,7 +235,7 @@ def capture_coverage_gcov(
 
 def _collect_worker(
     worker_id: int,
-    test_slice: list[tuple[int, str]],
+    test_slice: list[dict],
     build_dir_str: str,
     coverage_dir_str: str,
     repo_root_str: str,
@@ -188,6 +249,10 @@ def _collect_worker(
     per test.  gcda files are isolated to this worker's GCOV_PREFIX directory
     so concurrent workers never interfere with each other.
 
+    Each test is invoked directly via the command/cwd/env/timeout captured by
+    load_ctest_index() — ctest itself is never invoked here, avoiding its
+    per-invocation full-binary GTest rescan (see module docstring).
+
     Returns a list of test names that failed.
     """
     build_dir = Path(build_dir_str)
@@ -196,10 +261,18 @@ def _collect_worker(
     prefix_dir = Path(prefix_base_str) / f"worker_{worker_id}"
     prefix_dir.mkdir(parents=True, exist_ok=True)
 
+    # Per-test test-execution-vs-gcov-capture timing, appended as one JSON line
+    # per test. Separate from .cov.json (whose schema build_mapping.py depends
+    # on) — purely diagnostic, to measure how much of the per-test wall time is
+    # test execution vs. gcov post-processing before deciding whether it's
+    # worth overlapping the two.
+    timing_log = coverage_dir / f"timing_worker_{worker_id}.jsonl"
+
     total = len(test_slice)
     failures: list[str] = []
 
-    for i, (test_index, test) in enumerate(test_slice, 1):
+    for i, entry in enumerate(test_slice, 1):
+        test = entry["name"]
         sname = safe_name(test)
         cov_json = coverage_dir / f"{sname}.cov.json"
         jit_log = coverage_dir / f"{sname}.jit.log"
@@ -214,28 +287,59 @@ def _collect_worker(
         for gcda in prefix_dir.rglob("*.gcda"):
             gcda.unlink(missing_ok=True)
 
+        # Apply the test's own ctest-declared environment first (if any), then
+        # our worker pinning last so it always wins on conflict.
         env = os.environ.copy()
+        env.update(entry["environment"])
         env["GCOV_PREFIX"] = str(prefix_dir)
-        env["CUVS_JIT_TRACE_LOG"] = str(jit_log)
+        env["RTCX_JIT_TRACE_LOG"] = str(jit_log)
         env["CUDA_VISIBLE_DEVICES"] = str(worker_id % n_gpus)
 
-        result = subprocess.run(
-            ["ctest", "-I", f"{test_index},{test_index}", "--output-on-failure"],
-            cwd=build_dir,
-            env=env,
-        )
-        if result.returncode != 0:
+        cwd = entry["working_directory"] or str(build_dir)
+
+        test_start = time.monotonic()
+        try:
+            result = subprocess.run(
+                entry["command"],
+                cwd=cwd,
+                env=env,
+                timeout=entry["timeout"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            returncode = result.returncode
+            output = result.stdout
+        except subprocess.TimeoutExpired as exc:
+            returncode = 1
+            output = (exc.stdout or "") + f"\n[collect_coverage.py] TIMEOUT after {entry['timeout']}s"
+        except OSError as exc:
+            returncode = 1
+            output = f"[collect_coverage.py] failed to launch test: {exc}"
+        test_seconds = time.monotonic() - test_start
+
+        if returncode != 0:
             print(f"  [w{worker_id}] WARNING: test failed — coverage captured anyway: {test}",
                   flush=True)
+            print(output, flush=True)
             failures.append(test)
             if not continue_on_failure:
                 return failures
 
+        gcov_start = time.monotonic()
         capture_coverage_gcov(
             build_dir, cov_json, test,
             repo_root=repo_root,
             prefix_dir=prefix_dir,
         )
+        gcov_seconds = time.monotonic() - gcov_start
+
+        with open(timing_log, "a") as f:
+            f.write(json.dumps({
+                "test": test,
+                "test_seconds": round(test_seconds, 3),
+                "gcov_seconds": round(gcov_seconds, 3),
+            }) + "\n")
 
     return failures
 
@@ -307,14 +411,19 @@ def main() -> None:
 
     coverage_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Discovering gtest_case tests in {build_dir} ...", flush=True)
-    tests = list_gtest_case_tests(build_dir)
+    print(f"Discovering gtest_case tests in {build_dir} (one-time ctest invocation) ...",
+          flush=True)
+    tests = load_ctest_index(build_dir)
     if not tests:
         sys.exit(
             "ERROR: no tests found with label 'gtest_case'. "
             "Ensure the coverage build includes gtest_discover_tests() in ConfigureTest()."
         )
-    print(f"Found {len(tests)} test(s).", flush=True)
+    unique_names = len({t["name"] for t in tests})
+    print(f"Found {len(tests)} test invocation(s) ({unique_names} unique name(s)). "
+          f"ctest will not be invoked again for the remainder of this run.", flush=True)
+
+    (coverage_dir / "ctest_test_index.json").write_text(json.dumps(tests, indent=2) + "\n")
 
     n_gpus = args.gpus if args.gpus is not None else detect_gpu_count()
     n_workers = min(args.jobs if args.jobs is not None else n_gpus, len(tests))
@@ -325,7 +434,7 @@ def main() -> None:
 
     # Round-robin assignment keeps each worker's slice roughly equal in length
     # and spreads slow/fast tests across workers rather than front-loading them.
-    chunks: list[list[tuple[int, str]]] = [tests[i::n_workers] for i in range(n_workers)]
+    chunks: list[list[dict]] = [tests[i::n_workers] for i in range(n_workers)]
 
     worker_args = [
         (

@@ -16,15 +16,25 @@ function(find_and_configure_rtcx VERSION)
   include("${rapids-cmake-dir}/cmake/default_install_component.cmake")
   rapids_cmake_default_install_component(DEFAULT_USE_PROJECT_NAME)
 
+  # Applies local patches on top of the pinned librtcx commit until they land upstream (see
+  # cpp/cmake/patches/rtcx_override.json for details and PR links). git_url/git_tag/git_shallow
+  # live in the override file since rtcx has no entry in rapids-cmake's built-in versions.json.
+  include("${rapids-cmake-dir}/cpm/package_override.cmake")
+  rapids_cpm_package_override("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../patches/rtcx_override.json")
+
+  include("${rapids-cmake-dir}/cpm/detail/package_info.cmake")
+  rapids_cpm_package_info(rtcx
+    VERSION_VAR version
+    FIND_VAR find_args
+    CPM_VAR cpm_args
+  )
+
   rapids_cpm_find(
-    rtcx ${VERSION}
+    rtcx ${version} ${find_args}
     GLOBAL_TARGETS rtcx::rtcx
     BUILD_EXPORT_SET    cuvs-static-exports
     INSTALL_EXPORT_SET  cuvs-static-exports
-    CPM_ARGS
-    GIT_REPOSITORY https://github.com/rapidsai/librtcx
-    GIT_TAG a9f63f8cdd4b0b41a2d88a9f705576a61b4222ec
-    GIT_SHALLOW FALSE
+    CPM_ARGS ${cpm_args}
   )
 
   # When CPM fetches from source (add_subdirectory), generate_jit_lto_kernels.cmake is not

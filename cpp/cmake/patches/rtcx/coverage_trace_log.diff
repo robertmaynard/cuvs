@@ -1,0 +1,30 @@
+diff --git a/src/algorithm_planner.cpp b/src/algorithm_planner.cpp
+index 5dd2f81..9949347 100644
+--- a/src/algorithm_planner.cpp
++++ b/src/algorithm_planner.cpp
+@@ -11,6 +11,8 @@
+ #include <rtcx/nvjitlink_checker.hpp>
+ 
+ #include <chrono>
++#include <cstdlib>
++#include <fstream>
+ #include <iterator>
+ #include <memory>
+ #include <mutex>
+@@ -81,6 +83,16 @@ std::shared_ptr<algorithm_launcher> algorithm_planner::build()
+     frag->add_to(handle);
+   }
+ 
++  // When RTCX_JIT_TRACE_LOG is set (e.g. during coverage collection), append every activated
++  // fragment key to the named file so downstream tooling can associate JIT-LTO kernel sources
++  // with the tests that exercise them. Zero overhead when unset.
++  if (const char* trace_log_path = std::getenv("RTCX_JIT_TRACE_LOG")) {
++    std::ofstream log(trace_log_path, std::ios::app);
++    for (auto const& frag : this->fragments) {
++      log << frag->get_key() << "\n";
++    }
++  }
++
+   // Call to nvJitLinkComplete causes linker to link together all the LTO-IR
+   // modules perform any optimizations and generate cubin from it.
+   result = nvJitLinkComplete(handle);
