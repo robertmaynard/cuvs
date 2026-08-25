@@ -18,6 +18,7 @@
 #                         (default: <build-dir>/per_test_coverage)
 #   --output PATH         func2tests.json output path (default: <repo>/func2tests.json)
 #   -j N                  Parallel collection workers (default: number of GPUs detected by nvidia-smi)
+#   --post-process-slots N  Concurrent gcov post-processing slots per worker (default: 2)
 #
 # Prerequisites:
 #   cmake, ninja, gcov (bundled with GCC), python3, and a GPU-capable host with
@@ -34,15 +35,17 @@ COVERAGE_DIR=""
 MAPPING_OUT="$REPO_ROOT/func2tests.json"
 SKIP_BUILD=0
 JOBS=""
+POST_PROCESS_SLOTS=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --skip-build)   SKIP_BUILD=1; shift ;;
-    --build-dir)    BUILD_DIR="$2"; shift 2 ;;
-    --coverage-dir) COVERAGE_DIR="$2"; shift 2 ;;
-    --output)       MAPPING_OUT="$2"; shift 2 ;;
-    -j)             JOBS="$2"; shift 2 ;;
-    -j*)            JOBS="${1#-j}"; shift ;;
+    --skip-build)          SKIP_BUILD=1; shift ;;
+    --build-dir)           BUILD_DIR="$2"; shift 2 ;;
+    --coverage-dir)        COVERAGE_DIR="$2"; shift 2 ;;
+    --output)              MAPPING_OUT="$2"; shift 2 ;;
+    -j)                    JOBS="$2"; shift 2 ;;
+    -j*)                   JOBS="${1#-j}"; shift ;;
+    --post-process-slots)  POST_PROCESS_SLOTS="$2"; shift 2 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -70,6 +73,8 @@ fi
 echo "==> Collecting per-test coverage ..."
 JOBS_ARG=""
 [[ -n "$JOBS" ]] && JOBS_ARG="-j $JOBS"
+SLOTS_ARG=""
+[[ -n "$POST_PROCESS_SLOTS" ]] && SLOTS_ARG="--post-process-slots $POST_PROCESS_SLOTS"
 
 python3 "$SCRIPT_DIR/collect_coverage.py" \
   --build-dir    "$BUILD_DIR"    \
@@ -77,7 +82,7 @@ python3 "$SCRIPT_DIR/collect_coverage.py" \
   --repo-root    "$REPO_ROOT"    \
   --continue-on-failure          \
   --resume                       \
-  $JOBS_ARG
+  $JOBS_ARG $SLOTS_ARG
 
 # ── Step 3: Build function→test mapping ──────────────────────────────────────
 MAPPING_SCRIPT="$SCRIPT_DIR/build_mapping.py"

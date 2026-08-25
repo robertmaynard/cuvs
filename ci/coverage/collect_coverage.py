@@ -33,6 +33,28 @@
 #   did for free: pass/fail via returncode, timeout enforcement, and
 #   output-on-failure-only logging.
 #
+# gcov post-processing runs off the GPU-bound hot path (--post-process-slots):
+#   Measured on a real run: gcov post-processing (deleting/regenerating gcda,
+#   parsing .gcov.json.gz across ~376 files) costs a near-constant ~17s per
+#   test regardless of how long the test itself took (it re-scans the whole
+#   gcda set every invocation). For the median test (~1.3s of actual runtime),
+#   that made gcov bookkeeping ~93% of the test's contribution to wall time —
+#   the GPU sat idle while the CPU parsed gcov output.
+#
+#   Each worker now detaches a completed test's gcda tree with a single
+#   `os.replace()` (an O(1) metadata rename on the same filesystem — no data
+#   copy) into a uniquely-named snapshot directory, immediately recreates an
+#   empty GCOV_PREFIX directory, and launches the *next* test right away. The
+#   detached snapshot is handed off to a background ThreadPoolExecutor
+#   (`--post-process-slots`, default 2) that runs the actual `gcov` calls and
+#   writes .cov.json concurrently with the next test's execution. A
+#   `threading.Semaphore` bounds how many snapshots can be in flight at once,
+#   so if post-processing ever falls behind test execution the main loop
+#   blocks on submission rather than letting undelivered gcda snapshots pile
+#   up on disk. All pending background work is drained before a worker
+#   returns (including on early abort without --continue-on-failure), so no
+#   .cov.json write is ever left incomplete when the script exits.
+#
 # Parallelism (-j N):
 #   Each worker is assigned a non-overlapping slice of the test list and runs
 #   its tests sequentially.  Workers are isolated via GCOV_PREFIX: each worker
@@ -48,9 +70,11 @@ import json
 import multiprocessing
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -229,6 +253,45 @@ def capture_coverage_gcov(
     cov_json.write_text(json.dumps(result, indent=2) + "\n")
 
 
+def _post_process_test(
+    build_dir: Path,
+    cov_json: Path,
+    test: str,
+    repo_root: Path,
+    snapshot_dir: Path,
+    test_seconds: float,
+    timing_log: Path,
+    timing_lock: threading.Lock,
+    worker_id: int,
+) -> None:
+    """
+    Background task: run gcov on a detached gcda snapshot, write .cov.json,
+    clean up the snapshot directory, and append a timing record. Runs
+    concurrently with the *next* test's execution — see module docstring.
+    """
+    gcov_start = time.monotonic()
+    try:
+        capture_coverage_gcov(
+            build_dir, cov_json, test,
+            repo_root=repo_root,
+            prefix_dir=snapshot_dir,
+        )
+    finally:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+    gcov_seconds = time.monotonic() - gcov_start
+
+    record = json.dumps({
+        "test": test,
+        "test_seconds": round(test_seconds, 3),
+        "gcov_seconds": round(gcov_seconds, 3),
+    }) + "\n"
+    # Multiple background threads in this worker process append concurrently;
+    # a lock keeps JSONL lines from interleaving mid-write.
+    with timing_lock:
+        with open(timing_log, "a") as f:
+            f.write(record)
+
+
 # ---------------------------------------------------------------------------
 # Worker — must be module-level to be picklable by multiprocessing
 # ---------------------------------------------------------------------------
@@ -243,6 +306,7 @@ def _collect_worker(
     continue_on_failure: bool,
     resume: bool,
     n_gpus: int = 1,
+    post_process_slots: int = 4,
 ) -> list[str]:
     """
     Run a slice of tests sequentially, writing one .cov.json and one .jit.log
@@ -253,6 +317,12 @@ def _collect_worker(
     load_ctest_index() — ctest itself is never invoked here, avoiding its
     per-invocation full-binary GTest rescan (see module docstring).
 
+    gcov post-processing for a completed test runs in the background — see
+    the "gcov post-processing runs off the GPU-bound hot path" section of the
+    module docstring for the detach-and-handoff design and why it's needed
+    (a naive fire-and-forget submit would race the next test's writes into
+    the same GCOV_PREFIX directory).
+
     Returns a list of test names that failed.
     """
     build_dir = Path(build_dir_str)
@@ -260,86 +330,116 @@ def _collect_worker(
     repo_root = Path(repo_root_str)
     prefix_dir = Path(prefix_base_str) / f"worker_{worker_id}"
     prefix_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_base = Path(prefix_base_str) / f"worker_{worker_id}_snapshots"
+    snapshot_base.mkdir(parents=True, exist_ok=True)
 
     # Per-test test-execution-vs-gcov-capture timing, appended as one JSON line
-    # per test. Separate from .cov.json (whose schema build_mapping.py depends
-    # on) — purely diagnostic, to measure how much of the per-test wall time is
-    # test execution vs. gcov post-processing before deciding whether it's
-    # worth overlapping the two.
+    # per test by _post_process_test (background thread) once gcov actually
+    # finishes for that test. Separate from .cov.json (whose schema
+    # build_mapping.py depends on) — purely diagnostic.
     timing_log = coverage_dir / f"timing_worker_{worker_id}.jsonl"
+    timing_lock = threading.Lock()
 
     total = len(test_slice)
     failures: list[str] = []
 
-    for i, entry in enumerate(test_slice, 1):
-        test = entry["name"]
-        sname = safe_name(test)
-        cov_json = coverage_dir / f"{sname}.cov.json"
-        jit_log = coverage_dir / f"{sname}.jit.log"
+    backlog = threading.Semaphore(post_process_slots)
+    pending: list[concurrent.futures.Future] = []
 
-        if resume and cov_json.exists():
-            print(f"[w{worker_id} {i}/{total}] skip: {test}", flush=True)
-            continue
+    def _release_on_done(fut: concurrent.futures.Future) -> None:
+        backlog.release()
 
-        print(f"[w{worker_id} {i}/{total}] {test}", flush=True)
+    post_pool = concurrent.futures.ThreadPoolExecutor(max_workers=post_process_slots)
 
-        # Clear this worker's isolated gcda tree before each test
-        for gcda in prefix_dir.rglob("*.gcda"):
-            gcda.unlink(missing_ok=True)
+    def _drain() -> None:
+        for fut in pending:
+            fut.result()  # re-raise any exception from a background task
+        pending.clear()
 
-        # Apply the test's own ctest-declared environment first (if any), then
-        # our worker pinning last so it always wins on conflict.
-        env = os.environ.copy()
-        env.update(entry["environment"])
-        env["GCOV_PREFIX"] = str(prefix_dir)
-        env["RTCX_JIT_TRACE_LOG"] = str(jit_log)
-        env["CUDA_VISIBLE_DEVICES"] = str(worker_id % n_gpus)
+    try:
+        for i, entry in enumerate(test_slice, 1):
+            test = entry["name"]
+            sname = safe_name(test)
+            cov_json = coverage_dir / f"{sname}.cov.json"
+            jit_log = coverage_dir / f"{sname}.jit.log"
 
-        cwd = entry["working_directory"] or str(build_dir)
+            if resume and cov_json.exists():
+                print(f"[w{worker_id} {i}/{total}] skip: {test}", flush=True)
+                continue
 
-        test_start = time.monotonic()
-        try:
-            result = subprocess.run(
-                entry["command"],
-                cwd=cwd,
-                env=env,
-                timeout=entry["timeout"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+            print(f"[w{worker_id} {i}/{total}] {test}", flush=True)
+
+            # Apply the test's own ctest-declared environment first (if any),
+            # then our worker pinning last so it always wins on conflict.
+            env = os.environ.copy()
+            env.update(entry["environment"])
+            env["GCOV_PREFIX"] = str(prefix_dir)
+            env["RTCX_JIT_TRACE_LOG"] = str(jit_log)
+            env["CUDA_VISIBLE_DEVICES"] = str(worker_id % n_gpus)
+
+            cwd = entry["working_directory"] or str(build_dir)
+
+            # prefix_dir is guaranteed empty here: the previous iteration
+            # detached it (rename below) immediately after its test finished.
+            test_start = time.monotonic()
+            try:
+                result = subprocess.run(
+                    entry["command"],
+                    cwd=cwd,
+                    env=env,
+                    timeout=entry["timeout"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                returncode = result.returncode
+                output = result.stdout
+            except subprocess.TimeoutExpired as exc:
+                returncode = 1
+                output = (exc.stdout or "") + f"\n[collect_coverage.py] TIMEOUT after {entry['timeout']}s"
+            except OSError as exc:
+                returncode = 1
+                output = f"[collect_coverage.py] failed to launch test: {exc}"
+            test_seconds = time.monotonic() - test_start
+
+            if returncode != 0:
+                print(f"  [w{worker_id}] WARNING: test failed — coverage captured anyway: {test}",
+                      flush=True)
+                print(output, flush=True)
+                failures.append(test)
+                if not continue_on_failure:
+                    _drain()
+                    return failures
+
+            # Detach this test's gcda tree with an O(1) rename (no data copy)
+            # and immediately recreate an empty GCOV_PREFIX so the next test
+            # can start without waiting on gcov. Only rename if the test
+            # actually produced coverage output (a crash before any gcda flush
+            # would leave prefix_dir empty, which is fine to skip).
+            snapshot_dir = snapshot_base / f"test_{i}"
+            if any(prefix_dir.iterdir()):
+                os.replace(prefix_dir, snapshot_dir)
+                prefix_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+            # Backpressure: block only if `post_process_slots` snapshots are
+            # already being processed. In steady state this never blocks —
+            # tests take longer than gcov parsing on average — but it caps
+            # how many un-processed gcda snapshots can pile up on disk if
+            # post-processing ever falls behind.
+            backlog.acquire()
+            future = post_pool.submit(
+                _post_process_test,
+                build_dir, cov_json, test, repo_root, snapshot_dir,
+                test_seconds, timing_log, timing_lock, worker_id,
             )
-            returncode = result.returncode
-            output = result.stdout
-        except subprocess.TimeoutExpired as exc:
-            returncode = 1
-            output = (exc.stdout or "") + f"\n[collect_coverage.py] TIMEOUT after {entry['timeout']}s"
-        except OSError as exc:
-            returncode = 1
-            output = f"[collect_coverage.py] failed to launch test: {exc}"
-        test_seconds = time.monotonic() - test_start
+            future.add_done_callback(_release_on_done)
+            pending.append(future)
 
-        if returncode != 0:
-            print(f"  [w{worker_id}] WARNING: test failed — coverage captured anyway: {test}",
-                  flush=True)
-            print(output, flush=True)
-            failures.append(test)
-            if not continue_on_failure:
-                return failures
-
-        gcov_start = time.monotonic()
-        capture_coverage_gcov(
-            build_dir, cov_json, test,
-            repo_root=repo_root,
-            prefix_dir=prefix_dir,
-        )
-        gcov_seconds = time.monotonic() - gcov_start
-
-        with open(timing_log, "a") as f:
-            f.write(json.dumps({
-                "test": test,
-                "test_seconds": round(test_seconds, 3),
-                "gcov_seconds": round(gcov_seconds, 3),
-            }) + "\n")
+        _drain()
+    finally:
+        post_pool.shutdown(wait=True)
 
     return failures
 
@@ -394,6 +494,20 @@ def main() -> None:
         help="Number of GPUs available for CUDA_VISIBLE_DEVICES pinning "
              "(default: auto-detected via nvidia-smi)",
     )
+    parser.add_argument(
+        "--post-process-slots",
+        type=int,
+        default=4,
+        help="Max gcda snapshots concurrently undergoing gcov post-processing "
+             "in the background, per worker (default: 4 — 2 was measured "
+             "insufficient to fully hide gcov behind test execution for "
+             "gcov-heavy suites; raised given ample CPU headroom, see proposal). "
+             "gcov post-processing runs off the test-execution hot path; this "
+             "bounds the backlog if it ever falls behind. Each slot internally "
+             "fans out gcov across a test's gcda files with up to 8 threads, so total "
+             "concurrent gcov subprocesses per worker is roughly "
+             "8 * post-process-slots — raise cautiously on CPU-constrained hosts.",
+    )
     args = parser.parse_args()
 
     build_dir = Path(args.build_dir).resolve()
@@ -447,6 +561,7 @@ def main() -> None:
             args.continue_on_failure,
             args.resume,
             n_gpus,
+            args.post_process_slots,
         )
         for i, chunk in enumerate(chunks)
     ]
