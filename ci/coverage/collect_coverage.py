@@ -76,6 +76,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 _MAX_SAFE_LEN = 200
@@ -416,7 +417,11 @@ def _collect_worker(
             # can start without waiting on gcov. Only rename if the test
             # actually produced coverage output (a crash before any gcda flush
             # would leave prefix_dir empty, which is fine to skip).
-            snapshot_dir = snapshot_base / f"test_{i}"
+            #
+            # uuid4, not the loop-local index `i`: `i` repeats across
+            # restarts, and os.replace() requires the destination to not
+            # already exist (or be empty) — a name must be unique across runs.
+            snapshot_dir = snapshot_base / f"test_{uuid.uuid4().hex}"
             if any(prefix_dir.iterdir()):
                 os.replace(prefix_dir, snapshot_dir)
                 prefix_dir.mkdir(parents=True, exist_ok=True)
