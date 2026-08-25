@@ -45,9 +45,11 @@
 #   `os.replace()` (an O(1) metadata rename on the same filesystem — no data
 #   copy) into a uniquely-named snapshot directory, immediately recreates an
 #   empty GCOV_PREFIX directory, and launches the *next* test right away. The
-#   detached snapshot is handed off to a background ThreadPoolExecutor
-#   (`--post-process-slots`, default 2) that runs the actual `gcov` calls and
-#   writes .cov.json concurrently with the next test's execution. A
+#   detached snapshot is handed off to a background ProcessPoolExecutor
+#   (`--post-process-slots`, default 4) that runs the actual `gcov` calls and
+#   writes .cov.json concurrently with the next test's execution. Separate
+#   OS processes, not threads: gcov JSON parsing is CPU-bound, and threads
+#   sharing one GIL don't run that kind of work in parallel. A
 #   `threading.Semaphore` bounds how many snapshots can be in flight at once,
 #   so if post-processing ever falls behind test execution the main loop
 #   blocks on submission rather than letting undelivered gcda snapshots pile
@@ -256,13 +258,13 @@ def _post_process_test(
     snapshot_dir: Path,
     test_seconds: float,
     timing_log: Path,
-    timing_lock: threading.Lock,
     worker_id: int,
 ) -> None:
     """
     Background task: run gcov on a detached gcda snapshot, write .cov.json,
-    clean up the snapshot directory, and append a timing record. Runs
-    concurrently with the *next* test's execution — see module docstring.
+    clean up the snapshot directory, and append a timing record. Runs in its
+    own OS process (ProcessPoolExecutor), not a thread — see module
+    docstring.
     """
     gcov_start = time.monotonic()
     try:
@@ -275,16 +277,19 @@ def _post_process_test(
         shutil.rmtree(snapshot_dir, ignore_errors=True)
     gcov_seconds = time.monotonic() - gcov_start
 
-    record = json.dumps({
+    record = (json.dumps({
         "test": test,
         "test_seconds": round(test_seconds, 3),
         "gcov_seconds": round(gcov_seconds, 3),
-    }) + "\n"
-    # Multiple background threads in this worker process append concurrently;
-    # a lock keeps JSONL lines from interleaving mid-write.
-    with timing_lock:
-        with open(timing_log, "a") as f:
-            f.write(record)
+    }) + "\n").encode()
+    # O_APPEND writes at or under PIPE_BUF are atomic across processes at the
+    # OS level, so concurrent post-processing processes can append here
+    # without any lock (which couldn't cross a process boundary anyway).
+    fd = os.open(timing_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, record)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -329,11 +334,10 @@ def _collect_worker(
     snapshot_base.mkdir(parents=True, exist_ok=True)
 
     # Per-test test-execution-vs-gcov-capture timing, appended as one JSON line
-    # per test by _post_process_test (background thread) once gcov actually
+    # per test by _post_process_test (background process) once gcov actually
     # finishes for that test. Separate from .cov.json (whose schema
     # build_mapping.py depends on) — purely diagnostic.
     timing_log = coverage_dir / f"timing_worker_{worker_id}.jsonl"
-    timing_lock = threading.Lock()
 
     total = len(test_slice)
     failures: list[str] = []
@@ -344,7 +348,11 @@ def _collect_worker(
     def _release_on_done(fut: concurrent.futures.Future) -> None:
         backlog.release()
 
-    post_pool = concurrent.futures.ThreadPoolExecutor(max_workers=post_process_slots)
+    # ProcessPoolExecutor, not ThreadPoolExecutor: gcov JSON parsing is
+    # CPU-bound, so concurrent slots need separate GILs to actually run in
+    # parallel — see module docstring.
+    post_pool = concurrent.futures.ProcessPoolExecutor(
+        max_workers=post_process_slots, mp_context=multiprocessing.get_context("fork"))
 
     def _drain() -> None:
         for fut in pending:
@@ -431,7 +439,7 @@ def _collect_worker(
             future = post_pool.submit(
                 _post_process_test,
                 build_dir, cov_json, test, repo_root, snapshot_dir,
-                test_seconds, timing_log, timing_lock, worker_id,
+                test_seconds, timing_log, worker_id,
             )
             future.add_done_callback(_release_on_done)
             pending.append(future)
