@@ -158,9 +158,9 @@ def load_ctest_index(build_dir: Path) -> list[dict]:
     return entries
 
 
-def _process_gcda(args: tuple[Path, Path | None]) -> list[dict]:
+def _process_gcda(args: tuple[Path, Path | None, Path | None]) -> list[dict]:
     """Run gcov --json-format --stdout on one gcda file; return parsed file entries."""
-    gcda, prefix_dir = args
+    gcda, prefix_dir, cpp_root = args
 
     if prefix_dir is not None:
         # Recover the build-tree directory where the matching .gcno lives by
@@ -171,6 +171,11 @@ def _process_gcda(args: tuple[Path, Path | None]) -> list[dict]:
                     "-o", str(gcno_dir), str(gcda)]
     else:
         gcov_cmd = ["gcov", "--json-format", "--stdout", "--demangled-names", str(gcda)]
+
+    if cpp_root is not None:
+        # -r/-s: drop absolute-path (system header) entries from gcov's own
+        # output
+        gcov_cmd += ["-r", "-s", str(cpp_root)]
 
     result = subprocess.run(gcov_cmd, capture_output=True, text=True)
     try:
@@ -210,7 +215,7 @@ def capture_coverage_gcov(
     covered: dict[str, set[str]] = {}
     cpp_root = repo_root / "cpp" if repo_root else None
 
-    work_args = [(gcda, prefix_dir) for gcda in gcda_files]
+    work_args = [(gcda, prefix_dir, cpp_root) for gcda in gcda_files]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for file_entries in executor.map(_process_gcda, work_args):
