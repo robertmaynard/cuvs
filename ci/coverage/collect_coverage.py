@@ -64,7 +64,6 @@
 
 import argparse
 import concurrent.futures
-import gzip
 import hashlib
 import json
 import multiprocessing
@@ -73,7 +72,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -160,32 +158,25 @@ def load_ctest_index(build_dir: Path) -> list[dict]:
     return entries
 
 
-def _process_gcda(args: tuple[int, Path, Path, Path | None]) -> list[dict]:
-    """Run gcov --json-format on one gcda file; return parsed file entries."""
-    idx, gcda, tmp, prefix_dir = args
-    work = tmp / str(idx)
-    work.mkdir(exist_ok=True)
+def _process_gcda(args: tuple[Path, Path | None]) -> list[dict]:
+    """Run gcov --json-format --stdout on one gcda file; return parsed file entries."""
+    gcda, prefix_dir = args
 
     if prefix_dir is not None:
         # Recover the build-tree directory where the matching .gcno lives by
         # stripping the GCOV_PREFIX from the gcda path.
         rel = gcda.relative_to(prefix_dir)
         gcno_dir = Path("/") / rel.parent
-        gcov_cmd = ["gcov", "--json-format", "--demangled-names",
+        gcov_cmd = ["gcov", "--json-format", "--stdout", "--demangled-names",
                     "-o", str(gcno_dir), str(gcda)]
     else:
-        gcov_cmd = ["gcov", "--json-format", "--demangled-names", str(gcda)]
+        gcov_cmd = ["gcov", "--json-format", "--stdout", "--demangled-names", str(gcda)]
 
-    subprocess.run(gcov_cmd, cwd=work, capture_output=True)
-
-    results: list[dict] = []
-    for gz_file in work.glob("*.gcov.json.gz"):
-        try:
-            with gzip.open(gz_file) as gz:
-                results.extend(json.load(gz).get("files", []))
-        except Exception:
-            pass
-    return results
+    result = subprocess.run(gcov_cmd, capture_output=True, text=True)
+    try:
+        return json.loads(result.stdout).get("files", [])
+    except (json.JSONDecodeError, AttributeError):
+        return []
 
 
 def capture_coverage_gcov(
@@ -219,33 +210,31 @@ def capture_coverage_gcov(
     covered: dict[str, set[str]] = {}
     cpp_root = repo_root / "cpp" if repo_root else None
 
-    with tempfile.TemporaryDirectory(prefix="cuvs_gcov_") as tmpdir:
-        tmp = Path(tmpdir)
-        work_args = [(i, gcda, tmp, prefix_dir) for i, gcda in enumerate(gcda_files)]
+    work_args = [(gcda, prefix_dir) for gcda in gcda_files]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            for file_entries in executor.map(_process_gcda, work_args):
-                for file_data in file_entries:
-                    src = file_data.get("file", "")
-                    if cpp_root:
-                        try:
-                            rel = Path(src).resolve().relative_to(cpp_root)
-                            src_key = str(Path("cpp") / rel)
-                        except ValueError:
-                            continue
-                    elif "cuvs/cpp" in src:
-                        src_key = src[src.index("cuvs/cpp"):]
-                    else:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        for file_entries in executor.map(_process_gcda, work_args):
+            for file_data in file_entries:
+                src = file_data.get("file", "")
+                if cpp_root:
+                    try:
+                        rel = Path(src).resolve().relative_to(cpp_root)
+                        src_key = str(Path("cpp") / rel)
+                    except ValueError:
                         continue
+                elif "cuvs/cpp" in src:
+                    src_key = src[src.index("cuvs/cpp"):]
+                else:
+                    continue
 
-                    if "_deps" in src_key or "__pycache__" in src_key:
-                        continue
+                if "_deps" in src_key or "__pycache__" in src_key:
+                    continue
 
-                    for fn in file_data.get("functions", []):
-                        if fn.get("execution_count", 0) > 0:
-                            name = fn.get("demangled_name") or fn.get("name", "")
-                            if name:
-                                covered.setdefault(src_key, set()).add(name)
+                for fn in file_data.get("functions", []):
+                    if fn.get("execution_count", 0) > 0:
+                        name = fn.get("demangled_name") or fn.get("name", "")
+                        if name:
+                            covered.setdefault(src_key, set()).add(name)
 
     result = {
         "test_name": test_name,
