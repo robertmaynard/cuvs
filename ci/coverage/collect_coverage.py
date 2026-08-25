@@ -430,6 +430,17 @@ def _collect_worker(
             )
             future.add_done_callback(_release_on_done)
             pending.append(future)
+            # Prune completed futures so `pending` stays bounded near
+            # post_process_slots instead of growing for the worker's entire
+            # lifetime. .result(), not .done(), so a failed task still raises
+            # here rather than being silently dropped.
+            still_pending = []
+            for f in pending:
+                if f.done():
+                    f.result()
+                else:
+                    still_pending.append(f)
+            pending[:] = still_pending
 
         _drain()
     finally:
