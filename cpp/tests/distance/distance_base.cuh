@@ -483,7 +483,7 @@ void distanceLauncher(raft::resources const& handle,
                       std::int64_t m,
                       std::int64_t n,
                       std::int64_t k,
-                      DistanceInputs<OutputType>& params,
+                      DistanceInputs<DataType, OutputType>& params,
                       OutputType threshold,
                       OutputType metric_arg = 2.0f)
 {
@@ -502,7 +502,7 @@ template <cuvs::distance::DistanceType distanceType,
 class DistanceTest : public ::testing::TestWithParam<DistanceInputs<DataType, OutputType>> {
  public:
   DistanceTest()
-    : params(::testing::TestWithParam<DistanceInputs<OutputType>>::GetParam()),
+    : params(::testing::TestWithParam<DistanceInputs<DataType, OutputType>>::GetParam()),
       stream(raft::resource::get_cuda_stream(handle)),
       x(params.m * params.k, stream),
       y(params.n * params.k, stream),
@@ -578,7 +578,7 @@ class DistanceTest : public ::testing::TestWithParam<DistanceInputs<DataType, Ou
   raft::resources handle;
   cudaStream_t stream;
 
-  DistanceInputs<OutputType> params;
+  DistanceInputs<DataType, OutputType> params;
   rmm::device_uvector<DataType> x, y;
   rmm::device_uvector<OutputType> dist_ref, dist, dist2;
 };
@@ -598,7 +598,7 @@ class DistanceTestSameBuffer
  public:
   using dev_vector = rmm::device_uvector<OutputType>;
   DistanceTestSameBuffer()
-    : params(::testing::TestWithParam<DistanceInputs<OutputType>>::GetParam()),
+    : params(::testing::TestWithParam<DistanceInputs<DataType, OutputType>>::GetParam()),
       stream(raft::resource::get_cuda_stream(handle)),
       x(params.m * params.k, stream),
       dist_ref({dev_vector(params.m * params.m, stream), dev_vector(params.m * params.m, stream)}),
@@ -685,7 +685,7 @@ class DistanceTestSameBuffer
   raft::resources handle;
   cudaStream_t stream;
 
-  DistanceInputs<OutputType> params;
+  DistanceInputs<DataType, OutputType> params;
   rmm::device_uvector<DataType> x;
   static const std::int64_t N = 2;
   std::array<dev_vector, N> dist_ref, dist, dist2;
