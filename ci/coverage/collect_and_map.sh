@@ -59,7 +59,7 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
   cmake --preset coverage -S "$REPO_ROOT/cpp"
 
   echo "==> Building ..."
-  cmake --build --preset coverage
+  (cd "$REPO_ROOT/cpp" && cmake --build --preset coverage)
 else
   echo "==> Skipping build (--skip-build)"
 fi
