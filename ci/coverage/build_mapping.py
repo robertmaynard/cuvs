@@ -150,6 +150,7 @@ def main() -> None:
     # {repo_relative_source_file: {test_name, ...}}
     file2tests: dict[str, set[str]] = {}
     already_recorded: set[str] = set()
+    last_build_mtime = 0.0
 
     if args.update and output_path.exists():
         print(f"Loading existing mapping from {output_path} ...", flush=True)
@@ -160,21 +161,42 @@ def main() -> None:
             already_recorded.update(tests)
         for src, tests in existing.get("files", {}).items():
             file2tests[src] = set(tests)
-        print(f"  {len(already_recorded)} test(s) already recorded — will skip their .cov.json files.", flush=True)
+        last_build_mtime = output_path.stat().st_mtime
+        print(f"  {len(already_recorded)} test(s) already recorded.", flush=True)
 
-    new_files = [p for p in cov_files if _peek_test_name(p) not in already_recorded]
-    print(f"Parsing {len(new_files)} new coverage file(s) (of {len(cov_files)} total) ...", flush=True)
+    # A .cov.json needs (re)parsing if it's new, or if it was rewritten (e.g.
+    # a --resume re-collected that test, or its source changed) since the
+    # last time this mapping was built — not just "have we ever seen this
+    # test name before". Skipping purely on prior test-name membership froze
+    # every test's association at whatever it was on first sight, forever,
+    # even across collection runs against later, different code.
+    to_process = [p for p in cov_files if p.stat().st_mtime > last_build_mtime]
+    print(f"Parsing {len(to_process)} new/updated coverage file(s) (of {len(cov_files)} total) ...",
+          flush=True)
 
-    for cov_path in new_files:
+    refreshed = 0
+    for cov_path in to_process:
         test_name, coverage = parse_cov_json(cov_path)
         if not test_name:
             print(f"  WARNING: no test_name in {cov_path.name}, skipping", flush=True)
             continue
 
+        if test_name in already_recorded:
+            # Re-collected test: drop its old associations before merging the
+            # fresh ones, so functions/files it no longer covers don't linger.
+            for tests in func2tests.values():
+                tests.discard(test_name)
+            for tests in file2tests.values():
+                tests.discard(test_name)
+            refreshed += 1
+
         for rel_src, functions in coverage.items():
             file2tests.setdefault(rel_src, set()).add(test_name)
             for fn in functions:
                 func2tests.setdefault(fn, set()).add(test_name)
+
+    if refreshed:
+        print(f"  {refreshed} previously-recorded test(s) refreshed with updated coverage.", flush=True)
 
     print(
         f"  {len(func2tests)} functions, {len(file2tests)} source files indexed.",
@@ -195,10 +217,12 @@ def main() -> None:
             flush=True,
         )
 
-    # Serialise — sets → sorted lists for stable output
+    # Serialise — sets → sorted lists for stable output. Drop entries a
+    # refresh emptied out entirely (discard() above removes the test from
+    # the set but not the now-empty key itself).
     mapping = {
-        "functions": {k: sorted(v) for k, v in sorted(func2tests.items())},
-        "files":     {k: sorted(v) for k, v in sorted(file2tests.items())},
+        "functions": {k: sorted(v) for k, v in sorted(func2tests.items()) if v},
+        "files":     {k: sorted(v) for k, v in sorted(file2tests.items()) if v},
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
