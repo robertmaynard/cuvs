@@ -270,7 +270,10 @@ def main() -> None:
     if args.base_tests:
         base_path = Path(args.base_tests)
         if base_path.exists():
-            base_tests = [l.strip() for l in base_path.read_text().splitlines() if l.strip()]
+            base_tests = [
+                l.strip() for l in base_path.read_text().splitlines()
+                if l.strip() and not l.strip().startswith("#")
+            ]
             selected.update(base_tests)
 
     # 4. Intersect with live registered tests to guard against stale mapping entries
