@@ -165,12 +165,20 @@ def _process_gcda(args: tuple[Path, Path | None, Path | None]) -> list[dict]:
     gcda, prefix_dir, cpp_root = args
 
     if prefix_dir is not None:
-        # Recover the build-tree directory where the matching .gcno lives by
-        # stripping the GCOV_PREFIX from the gcda path.
+        # gcov's -o searches DIR for both the .gcno and the .gcda; a .gcda
+        # living outside that directory is silently ignored (reads back as
+        # execution_count 0 for every function, with only a benign stderr
+        # message — nothing on stdout indicates anything went wrong). Copy
+        # the .gcno from its build-tree location next to the redirected
+        # .gcda so both are visible to the same -o call.
         rel = gcda.relative_to(prefix_dir)
         gcno_dir = Path("/") / rel.parent
+        gcno_src = gcno_dir / gcda.with_suffix(".gcno").name
+        gcno_dst = gcda.with_suffix(".gcno")
+        if gcno_src.exists() and not gcno_dst.exists():
+            shutil.copy(gcno_src, gcno_dst)
         gcov_cmd = ["gcov", "--json-format", "--stdout", "--demangled-names",
-                    "-o", str(gcno_dir), str(gcda)]
+                    "-o", str(gcda.parent), str(gcda)]
     else:
         gcov_cmd = ["gcov", "--json-format", "--stdout", "--demangled-names", str(gcda)]
 
