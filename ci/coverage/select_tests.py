@@ -27,6 +27,37 @@ def _suffix(name: str, n: int) -> str:
     return "::".join(parts[-n:]) if len(parts) >= n else name
 
 
+def _strip_signature(name: str) -> str:
+    """
+    Remove a trailing (...) parameter list from a demangled gcov function
+    name — e.g. "Foo::SetUp()" -> "Foo::SetUp", "Foo::Bar() const" ->
+    "Foo::Bar". ctags names never include a parameter list, so leaving gcov's
+    in place breaks suffix/bare-identifier comparison for every class member
+    function (the trailing "()" survives template stripping since that only
+    removes <...>).  Finds the last top-level "(...)" via a balanced
+    backward scan (safe against nested parens inside template non-type
+    arguments, since those already were removed by the caller's <...> strip)
+    and splices it out, then drops common trailing qualifiers.
+    """
+    close = name.rfind(")")
+    if close == -1:
+        return name
+    depth = 0
+    open_idx = -1
+    for i in range(close, -1, -1):
+        if name[i] == ")":
+            depth += 1
+        elif name[i] == "(":
+            depth -= 1
+            if depth == 0:
+                open_idx = i
+                break
+    if open_idx == -1:
+        return name
+    stripped = name[:open_idx] + name[close + 1:]
+    return re.sub(r"\s*(const|noexcept|&&|&)\s*$", "", stripped).strip()
+
+
 def find_tests_for_function(ctags_name: str, func_map: dict[str, list[str]]) -> set[str]:
     """
     Return the set of tests covering ctags_name by trying four strategies
@@ -38,7 +69,7 @@ def find_tests_for_function(ctags_name: str, func_map: dict[str, list[str]]) -> 
 
     tests: set[str] = set()
     for gcov_name, test_list in func_map.items():
-        bare_gcov = re.sub(r"<[^>]*>", "", gcov_name)
+        bare_gcov = _strip_signature(re.sub(r"<[^>]*>", "", gcov_name))
 
         # Strategy 1: exact
         if ctags_name == gcov_name:
