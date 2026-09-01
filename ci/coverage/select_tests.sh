@@ -135,22 +135,24 @@ fi
 if [[ -s "$CHANGED_FILES" ]]; then
   echo "==> Running ctags on changed source files ..."
 
-  # Build list of files that actually exist (deleted files are skipped)
+  # Build list of files that actually exist (deleted files are skipped).
+  # Kept repo-relative (not $REPO_ROOT/$f) and run from $REPO_ROOT below, so
+  # ctags' own "path" field matches $CHANGED_FILES' format exactly —
+  # select_tests.py compares them directly to track per-file function hits.
   EXISTING_FILES=()
   while IFS= read -r f; do
-    full="$REPO_ROOT/$f"
-    [[ -f "$full" ]] && EXISTING_FILES+=("$full")
+    [[ -f "$REPO_ROOT/$f" ]] && EXISTING_FILES+=("$f")
   done < "$CHANGED_FILES"
 
   if [[ ${#EXISTING_FILES[@]} -gt 0 ]]; then
-    "$CTAGS_BIN" \
+    (cd "$REPO_ROOT" && "$CTAGS_BIN" \
       --output-format=json \
       --fields=+nKs \
       --kinds-C++=f+p \
       --kinds-CUDA=f \
       --langmap=C++:+.cuh \
       -f - \
-      "${EXISTING_FILES[@]}" \
+      "${EXISTING_FILES[@]}") \
       > "$CTAGS_JSONL" 2>"$WORK_DIR/ctags_stderr.txt" || true
     N_TAGS=$(wc -l < "$CTAGS_JSONL")
     echo "  $N_TAGS tag(s) extracted"
